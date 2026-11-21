@@ -4,13 +4,14 @@ from __future__ import annotations
 import csv
 import io
 import time
+import urllib.parse
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
-from app.services import service_for
+from app.services import export_files, service_for
 from app.store import store
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
@@ -195,16 +196,103 @@ def pipeline_schema_drift_detect(source_id: int = Query(...)) -> dict[str, Any]:
 @router.post("/pipelines/export-to-mart")
 def pipeline_export_to_mart(
     export_no: str = Query(...), fmt: str = Query(default="csv"), mart_id: int = Query(default=0),
+    partition_by: str | None = Query(default=None),
+    field_list: str = Query(default="*"),
+    interrupt_partition: str | None = Query(default=None),
 ) -> dict[str, Any]:
     entry, missing = exporter_svc.create_entry({
         "任务编号": export_no, "数据来源": "result_cache,result_mart", "筛选条件": "all",
-        "输出格式": fmt, "字段列表": "*", "排序规则": "id", "导出上限": "10000",
+        "输出格式": fmt, "字段列表": field_list, "排序规则": "id", "导出上限": "10000",
         "接收地址": "local://exports"})
     if entry is None:
         raise HTTPException(status_code=400, detail=f"创建导出任务失败: {missing}")
+    interrupt = (
+        {"partition": interrupt_partition, "after_rows": 0}
+        if interrupt_partition
+        else None
+    )
     return {"ok": True, "pipeline": "export_to_mart",
-            "export": exporter_svc.export_query_results(entry["id"]),
-            "mart": exporter_svc.batch_export_to_mart(mart_id) if mart_id > 0 else None}
+            "export": exporter_svc.export_query_results(
+                entry["id"], partition_by=partition_by, interrupt=interrupt),
+            "mart": (
+                exporter_svc.batch_export_to_mart(
+                    mart_id, request_id=str(entry["任务编号"]))
+                if mart_id > 0 else None
+            )}
+
+
+# -- 导出文件 / 行数清单 / 集市领取回执 / 核账 --
+
+@router.get("/exports/{export_id}/manifest")
+def export_manifest(export_id: int) -> dict[str, Any]:
+    """导出清单：分区状态、行数、校验和、来源快照。"""
+    manifest = exporter_svc.manifest_for_export(export_id)
+    if manifest is None:
+        raise HTTPException(status_code=404, detail=f"导出清单 {export_id} 不存在")
+    return manifest
+
+
+@router.get("/exports/{export_id}/row-counts")
+def export_row_counts(export_id: int) -> dict[str, Any]:
+    """人可读的行数清单（CSV 行转 JSON，便于核对）。"""
+    return exporter_svc.row_count_listing(export_id)
+
+
+@router.post("/exports/{export_id}/resume")
+def export_resume(export_id: int) -> dict[str, Any]:
+    """交付恢复后续跑：已确认分区沿用原回执，补写未闭合分区。"""
+    return exporter_svc.resume_export(export_id)
+
+
+@router.get("/exports/{export_id}/files/{partition}")
+def export_partition_file(export_id: int, partition: str) -> StreamingResponse:
+    """领取某个已确认分区的 CSV 文件。"""
+    path = exporter_svc.partition_file(export_id, partition)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"分区 {partition} 无已确认文件")
+    quoted = urllib.parse.quote(path.name)
+    return StreamingResponse(
+        export_files.read_file_chunks(path),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=\"export_{export_id}.csv\"; "
+                f"filename*=UTF-8''{quoted}"
+            )
+        },
+    )
+
+
+@router.post("/marts/{mart_id}/claim")
+def mart_claim(
+    mart_id: int,
+    export_id: int | None = Query(default=None),
+    request_id: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """从集市领取可领取的导出文件，生成领取回执与覆盖说明。"""
+    return exporter_svc.batch_export_to_mart(
+        mart_id, export_id=export_id, request_id=request_id)
+
+
+@router.get("/marts/receipts/{claim_id}")
+def mart_receipt(claim_id: str) -> dict[str, Any]:
+    """按领取回执关联到当时的 CSV 文件、行数、来源快照与覆盖说明。"""
+    receipt = exporter_svc.claim_receipt(claim_id)
+    if receipt is None:
+        raise HTTPException(status_code=404, detail=f"领取回执 {claim_id} 不存在")
+    return receipt
+
+
+@router.get("/exports/requests/{request_id}/reconcile")
+def export_reconcile(request_id: str) -> dict[str, Any]:
+    """按同一申请核对两区总数：分区去重、CSV 记录数复核、未闭合排除。"""
+    return exporter_svc.reconcile_request(request_id)
+
+
+@router.get("/exports/requests/{request_id}/receipts")
+def export_request_receipts(request_id: str) -> dict[str, Any]:
+    """同一申请下所有领取回执与覆盖说明。"""
+    return exporter_svc.request_receipts(request_id)
 
 
 @router.post("/pipelines/lake-scan-register")

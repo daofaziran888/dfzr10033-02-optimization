@@ -81,5 +81,40 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 导出到集市：分段文件、分区回执与核账
+
+分析导出把结果缓存里的查询明细按分区、按块写成 CSV，内存里不再出现整份
+导出字符串。相关实现集中在 `app/services/export_files.py`（文件/回执/清单）
+与 `app/services/data_exporter.py`（分区编排、集市发布、核账）。
+
+- **字段顺序**：沿用导出任务申请里的「字段列表」，仅 `*`/空时回退到首行字段。
+- **CSV 转义**：换行、逗号、引号交给标准 `csv` 模块处理，跨行记录保持为一条记录。
+- **分区确认**：分区最后一段落盘并核对记录数闭合后才写 `confirmed` 回执；
+  空分区也写回执。中断时留下未闭合文件，不写回执。
+- **续跑**：已 `confirmed` 且磁盘校验通过的分区沿用原回执，只补写未完成分区。
+- **行数清单**：`manifest_export_<id>.json` 与 `rowcount_export_<id>.csv` 同步落盘，
+  记录状态、行数、校验和、回执编号与确认时间。
+- **集市发布**：只发布已确认且磁盘核对通过的分区；未闭合部分不计入已发布行数。
+  发布清单写入 `行数口径`、`有效分区`、`来源快照`，历史快照按 `legacy_all_rows`
+  口径兼容读取。
+- **领取回执**：领取时复制可领取 CSV 的快照并生成回执，内含覆盖说明与排除分区。
+- **核账**：按同一申请汇总多次领取，同一分区只计一份，并按回执里的 CSV 快照
+  重新数记录数复核。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/pipelines/export-to-mart` | 导出并（可选）发布到集市 |
+| GET | `/api/exports/{id}/manifest` | 导出清单（分区状态、行数、清单核对） |
+| GET | `/api/exports/{id}/row-counts` | 人可读行数清单 |
+| GET | `/api/exports/{id}/files/{partition}` | 领取已确认分区的 CSV |
+| POST | `/api/exports/{id}/resume` | 交付恢复后续跑 |
+| POST | `/api/marts/{id}/claim` | 从集市领取，生成回执 |
+| GET | `/api/marts/receipts/{claim_id}` | 回执详情（CSV、覆盖说明） |
+| GET | `/api/exports/requests/{request_id}/reconcile` | 按申请核对两区总数 |
+| GET | `/api/exports/requests/{request_id}/receipts` | 该申请全部领取回执 |
+
+导出文件默认写在系统临时目录下的 `lakehouse_exports/`，可用环境变量
+`DATA_EXPORT_DIR` 指定。
+
 领域：数据工程
 子方向：数据分析与数据应用
